@@ -25,6 +25,7 @@ NET COMMANDS
 
 | **bpftool** **net** { **show** | **list** } [ **dev** *NAME* ]
 | **bpftool** **net attach** *ATTACH_TYPE* *PROG* **dev** *NAME* [ **overwrite** | **prepend** ]
+| **bpftool** **net attach** **netfilter** *PROG* **pf** *PF* **hook** *HOOK* **prio** *PRIO* [ **defrag** ] **pin** *FILE*
 | **bpftool** **net detach** *ATTACH_TYPE* **dev** *NAME*
 | **bpftool** **net help**
 |
@@ -77,6 +78,38 @@ bpftool net attach *ATTACH_TYPE* *PROG* dev *NAME* [ overwrite | prepend ]
     For **tcx_ingress** and **tcx_egress** attach types, the **prepend** option
     can be used to attach the program at the beginning of the chain instead of
     at the end.
+
+bpftool net attach netfilter *PROG* pf *PF* hook *HOOK* prio *PRIO* [ defrag ] pin *FILE*
+    Attach bpf program *PROG*, of type **BPF_PROG_TYPE_NETFILTER**, to a
+    netfilter hook.
+
+    *PF* is the protocol family, **ipv4** or **ipv6**. *HOOK* is one of
+    **prerouting**, **input**, **forward**, **output** or **postrouting**.
+    *PRIO* is the hook priority; programs with a lower value run first. It is
+    either a signed integer or one of the usual names **raw** (-300),
+    **conntrack** (-200), **mangle** (-150), **dstnat** (-100), **filter** (0),
+    **security** (50) and **srcnat** (100). The kernel does not allow a bpf
+    program to use the same priority as any other hook already registered at
+    that hook point (for example the nftables **raw** chains), and fails the
+    attach with **EBUSY**. Since **bpftool** looks for options
+    anywhere on the command line, a negative number has to be preceded by
+    **--** placed before the object, as in
+    **bpftool -- net attach netfilter ... prio -250 ...**.
+
+    The **defrag** option enables IP defragmentation before the program runs.
+    It requires a *PRIO* greater than -400 (the priority of the kernel's
+    defragmentation hook), otherwise the attach fails with **ERANGE**. The
+    lowest and highest possible priorities are reserved and also rejected.
+
+    A netfilter program is attached through a bpf link, which is removed when
+    the last reference to it is closed. Since **bpftool** exits right after
+    attaching, **pin** is required: the link is pinned to *FILE* on a bpffs
+    and the hook stays active until the link is detached, for example with
+    **bpftool link detach pinned** *FILE* (and then removing *FILE*).
+
+    Unlike the other attach types, netfilter attachments are not tied to a
+    network interface, so **dev** is not used, and **bpftool net detach**
+    does not support them.
 
 bpftool net detach *ATTACH_TYPE* dev *NAME*
     Detach bpf program attached to network interface *NAME* with type specified

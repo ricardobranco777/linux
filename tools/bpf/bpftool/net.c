@@ -6,6 +6,7 @@
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -13,6 +14,8 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <net/if.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
 #include <linux/rtnetlink.h>
 #include <linux/socket.h>
 #include <linux/tc_act/tc_bpf.h>
@@ -69,6 +72,7 @@ enum net_attach_type {
 	NET_ATTACH_TYPE_XDP_OFFLOAD,
 	NET_ATTACH_TYPE_TCX_INGRESS,
 	NET_ATTACH_TYPE_TCX_EGRESS,
+	NET_ATTACH_TYPE_NETFILTER,
 };
 
 static const char * const attach_type_strings[] = {
@@ -78,6 +82,7 @@ static const char * const attach_type_strings[] = {
 	[NET_ATTACH_TYPE_XDP_OFFLOAD]	= "xdpoffload",
 	[NET_ATTACH_TYPE_TCX_INGRESS]	= "tcx_ingress",
 	[NET_ATTACH_TYPE_TCX_EGRESS]	= "tcx_egress",
+	[NET_ATTACH_TYPE_NETFILTER]	= "netfilter",
 };
 
 static const char * const attach_loc_strings[] = {
@@ -689,6 +694,151 @@ static int do_detach_tcx(int targetfd, enum net_attach_type attach_type)
 	return bpf_prog_detach(targetfd, type);
 }
 
+static const char * const nf_pf_names[] = {
+	[NFPROTO_IPV4]		= "ipv4",
+	[NFPROTO_IPV6]		= "ipv6",
+};
+
+static const char * const nf_hook_names[] = {
+	[NF_INET_PRE_ROUTING]	= "prerouting",
+	[NF_INET_LOCAL_IN]	= "input",
+	[NF_INET_FORWARD]	= "forward",
+	[NF_INET_LOCAL_OUT]	= "output",
+	[NF_INET_POST_ROUTING]	= "postrouting",
+};
+
+static const struct {
+	const char *name;
+	int prio;
+} nf_prio_names[] = {
+	{ "raw",	NF_IP_PRI_RAW },
+	{ "conntrack",	NF_IP_PRI_CONNTRACK },
+	{ "mangle",	NF_IP_PRI_MANGLE },
+	{ "dstnat",	NF_IP_PRI_NAT_DST },
+	{ "filter",	NF_IP_PRI_FILTER },
+	{ "security",	NF_IP_PRI_SECURITY },
+	{ "srcnat",	NF_IP_PRI_NAT_SRC },
+};
+
+static int nf_parse_prio(const char *str, int *prio)
+{
+	char *end;
+	long val;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(nf_prio_names); i++) {
+		if (!strcmp(str, nf_prio_names[i].name)) {
+			*prio = nf_prio_names[i].prio;
+			return 0;
+		}
+	}
+
+	errno = 0;
+	val = strtol(str, &end, 0);
+	if (errno || *end || end == str || val < INT_MIN || val > INT_MAX)
+		return -1;
+
+	*prio = val;
+	return 0;
+}
+
+static int nf_parse_name(const char * const *names, size_t n, const char *str)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		if (names[i] && !strcmp(str, names[i]))
+			return i;
+	}
+
+	return -1;
+}
+
+/* Unlike xdp and tcx, a netfilter program is attached through a bpf link,
+ * which only lives as long as its file descriptor. Pin it so the hook outlives
+ * this process; it can be removed with 'bpftool link detach pinned PATH'.
+ */
+static int do_attach_netfilter(int progfd, int argc, char **argv)
+{
+	LIBBPF_OPTS(bpf_link_create_opts, opts);
+	const char *pin_path = NULL;
+	bool have_prio = false;
+	int pf = -1, hook = -1;
+	int linkfd, err;
+
+	while (argc) {
+		if (is_prefix(*argv, "pf")) {
+			NEXT_ARG();
+			if (!REQ_ARGS(1))
+				return -EINVAL;
+			pf = nf_parse_name(nf_pf_names, ARRAY_SIZE(nf_pf_names), *argv);
+			if (pf < 0) {
+				p_err("invalid pf: '%s', expected ipv4 or ipv6", *argv);
+				return -EINVAL;
+			}
+		} else if (is_prefix(*argv, "hook")) {
+			NEXT_ARG();
+			if (!REQ_ARGS(1))
+				return -EINVAL;
+			hook = nf_parse_name(nf_hook_names, ARRAY_SIZE(nf_hook_names), *argv);
+			if (hook < 0) {
+				p_err("invalid hook: '%s', expected prerouting, input, forward, output or postrouting",
+				      *argv);
+				return -EINVAL;
+			}
+		} else if (is_prefix(*argv, "prio")) {
+			int prio;
+
+			NEXT_ARG();
+			if (!REQ_ARGS(1))
+				return -EINVAL;
+			if (nf_parse_prio(*argv, &prio)) {
+				p_err("invalid prio: '%s'", *argv);
+				return -EINVAL;
+			}
+			opts.netfilter.priority = prio;
+			have_prio = true;
+		} else if (is_prefix(*argv, "defrag")) {
+			opts.netfilter.flags |= BPF_F_NETFILTER_IP_DEFRAG;
+		} else if (is_prefix(*argv, "pin")) {
+			NEXT_ARG();
+			if (!REQ_ARGS(1))
+				return -EINVAL;
+			pin_path = *argv;
+		} else {
+			p_err("expected 'pf', 'hook', 'prio', 'defrag' or 'pin', got: '%s'?",
+			      *argv);
+			return -EINVAL;
+		}
+		NEXT_ARG();
+	}
+
+	if (pf < 0 || hook < 0 || !have_prio || !pin_path) {
+		p_err("netfilter attach needs 'pf', 'hook', 'prio' and 'pin'");
+		return -EINVAL;
+	}
+
+	opts.netfilter.pf = pf;
+	opts.netfilter.hooknum = hook;
+
+	linkfd = bpf_link_create(progfd, 0, BPF_NETFILTER, &opts);
+	if (linkfd < 0) {
+		const char *hint = "";
+
+		if (linkfd == -EBUSY)
+			hint = " (another hook already uses this priority at this hook point)";
+		else if (linkfd == -ERANGE)
+			hint = " (reserved prio, or prio <= -400 with defrag)";
+
+		p_err("netfilter attach failed: %s%s", strerror(-linkfd), hint);
+		return linkfd;
+	}
+
+	err = do_pin_fd(linkfd, pin_path);
+	close(linkfd);
+	return err;
+}
+
 static int do_attach(int argc, char **argv)
 {
 	enum net_attach_type attach_type;
@@ -710,6 +860,14 @@ static int do_attach(int argc, char **argv)
 	progfd = prog_parse_fd(&argc, &argv);
 	if (progfd < 0)
 		return -EINVAL;
+
+	if (attach_type == NET_ATTACH_TYPE_NETFILTER) {
+		err = do_attach_netfilter(progfd, argc, argv);
+		if (!err && json_output)
+			jsonw_null(json_wtr);
+		close(progfd);
+		return err;
+	}
 
 	ifindex = net_parse_dev(&argc, &argv);
 	if (ifindex < 1) {
@@ -788,6 +946,11 @@ static int do_detach(int argc, char **argv)
 		return -EINVAL;
 	}
 	NEXT_ARG();
+
+	if (attach_type == NET_ATTACH_TYPE_NETFILTER) {
+		p_err("netfilter links are not tied to a device, use 'bpftool link detach pinned PATH'");
+		return -EINVAL;
+	}
 
 	ifindex = net_parse_dev(&argc, &argv);
 	if (ifindex < 1)
@@ -1012,12 +1175,18 @@ static int do_help(int argc, char **argv)
 	fprintf(stderr,
 		"Usage: %1$s %2$s { show | list } [dev <devname>]\n"
 		"       %1$s %2$s attach ATTACH_TYPE PROG dev <devname> [ overwrite | prepend ]\n"
+		"       %1$s %2$s attach netfilter PROG pf PF hook HOOK prio PRIO [ defrag ]\n"
+		"                                         pin FILE\n"
 		"       %1$s %2$s detach ATTACH_TYPE dev <devname>\n"
 		"       %1$s %2$s help\n"
 		"\n"
 		"       " HELP_SPEC_PROGRAM "\n"
 		"       ATTACH_TYPE := { xdp | xdpgeneric | xdpdrv | xdpoffload | tcx_ingress\n"
 		"                        | tcx_egress }\n"
+		"       PF := { ipv4 | ipv6 }\n"
+		"       HOOK := { prerouting | input | forward | output | postrouting }\n"
+		"       PRIO := { <number> | raw | conntrack | mangle | dstnat | filter\n"
+		"                 | security | srcnat }\n"
 		"       " HELP_SPEC_OPTIONS " }\n"
 		"\n"
 		"Note: Only xdp, tcx, tc, netkit, flow_dissector and netfilter attachments\n"

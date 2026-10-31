@@ -1125,9 +1125,33 @@ _bpftool()
                     return 0
                     ;;
                 attach)
+                    if [[ ${words[3]} == netfilter && $cword -ge 6 ]]; then
+                        case $prev in
+                            pf)
+                                COMPREPLY=( $( compgen -W 'ipv4 ipv6' -- "$cur" ) )
+                                ;;
+                            hook)
+                                COMPREPLY=( $( compgen -W 'prerouting input \
+                                    forward output postrouting' -- "$cur" ) )
+                                ;;
+                            prio)
+                                COMPREPLY=( $( compgen -W 'raw conntrack \
+                                    mangle dstnat filter security srcnat' \
+                                    -- "$cur" ) )
+                                ;;
+                            pin)
+                                _filedir
+                                ;;
+                            *)
+                                _bpftool_once_attr 'pf hook prio defrag pin'
+                                ;;
+                        esac
+                        return 0
+                    fi
                     case $cword in
                         3)
-                            COMPREPLY=( $( compgen -W "$ATTACH_TYPES" -- "$cur" ) )
+                            COMPREPLY=( $( compgen -W "$ATTACH_TYPES netfilter" \
+                                -- "$cur" ) )
                             return 0
                             ;;
                         4)
